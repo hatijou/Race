@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Browser Racing Game</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #333;
+            font-family: 'Arial', sans-serif;
+            touch-action: none; /* スマホでのスクロール防止 */
+            user-select: none; /* テキスト選択防止 */
+        }
+
+        #gameCanvas {
+            display: block;
+        }
+
+        /* UIオーバーレイ */
+        #uiLayer {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            font-size: 20px;
+            text-shadow: 2px 2px 0 #000;
+            pointer-events: none; /* UIを通してキャンバスをクリックさせない */
+        }
+
+        #lapTime { font-weight: bold; }
+        #message { 
+            position: absolute; 
+            top: 40%; 
+            left: 50%; 
+            transform: translate(-50%, -50%); 
+            font-size: 40px; 
+            color: yellow; 
+            display: none; 
+            text-align: center;
+            text-shadow: 3px 3px 0 #000;
+        }
+
+        /* バーチャルパッド（スマホ用） */
+        .controls {
+            position: absolute;
+            bottom: 20px;
+            width: 100%;
+            display: flex;
+            justify-content: space-between;
+            padding: 0 20px;
+            box-sizing: border-box;
+            pointer-events: none; /* コンテナ自体はクリック透過 */
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 15px;
+            pointer-events: auto; /* ボタンはクリック有効 */
+        }
+
+        .btn {
+            width: 70px;
+            height: 70px;
+            background: rgba(255, 255, 255, 0.3);
+            border: 2px solid rgba(255, 255, 255, 0.6);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 24px;
+            font-weight: bold;
+            user-select: none;
+            cursor: pointer;
+        }
+
+        .btn:active, .btn.active {
+            background: rgba(255, 255, 255, 0.6);
+            transform: scale(0.95);
+        }
+
+        /* PC等でタッチがない場合は邪魔にならないように透明度を下げる、
+           またはメディアクエリで消すことも可能ですが、今回は常時表示します */
+    </style>
+</head>
+<body>
+
+    <div id="uiLayer">
+        <div>LAP: <span id="currentLap">1</span> / 3</div>
+        <div id="lapTime">TIME: 0.00</div>
+    </div>
+    
+    <div id="message">GOAL!<br><span style="font-size:20px">Touch/Click to Restart</span></div>
+
+    <canvas id="gameCanvas"></canvas>
+
+    <div class="controls">
+        <div class="btn-group">
+            <div class="btn" id="btnLeft">◀</div>
+            <div class="btn" id="btnRight">▶</div>
+        </div>
+        <div class="btn-group">
+            <div class="btn" id="btnBrake">B</div>
+            <div class="btn" id="btnGas" style="background: rgba(255, 100, 100, 0.4);">A</div>
+        </div>
+    </div>
+
+<script>
+    // --- 設定 ---
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    
+    // ゲームの状態
+    const gameState = {
+        lap: 1,
+        maxLaps: 3,
+        startTime: 0,
+        finished: false,
+        onRoad: true
+    };
+
+    // 車の設定
+    const car = {
+        x: 0, 
+        y: 0,
+        angle: -Math.PI / 2, // 上向き
+        speed: 0,
+        maxSpeed: 12,
+        acceleration: 0.2,
+        friction: 0.96,
+        turnSpeed: 0.07,
+        width: 20,
+        height: 36,
+        color: '#ff3333'
+    };
+
+    // コースデータ（簡易的なチェックポイントと描画用）
+    // Canvas全体に描画する関数として定義
+    const trackWidth = 140;
+    
+    // 入力状態
+    const input = {
+        up: false,
+        down: false,
+        left: false,
+        right: false
+    };
+
+    // --- 初期化 ---
+    function resize() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // スタート地点
+    car.x = 0;
+    car.y = 0;
+    
+    // チェックポイント管理
+    const checkpoints = [
+        {x: 0, y: -200, passed: false}, // スタートライン直後
+        {x: 800, y: -200, passed: false},
+        {x: 800, y: 600, passed: false},
+        {x: -800, y: 600, passed: false},
+        {x: -800, y: -200, passed: false}
+    ];
+
+    // --- 入力処理 ---
+    
+    // キーボード
+    window.addEventListener('keydown', (e) => setInput(e.code, true));
+    window.addEventListener('keyup', (e) => setInput(e.code, false));
+
+    function setInput(code, isPressed) {
+        if (code === 'ArrowUp' || code === 'KeyW') input.up = isPressed;
+        if (code === 'ArrowDown' || code === 'KeyS') input.down = isPressed;
+        if (code === 'ArrowLeft' || code === 'KeyA') input.left = isPressed;
+        if (code === 'ArrowRight' || code === 'KeyD') input.right = isPressed;
+    }
+
+    // タッチ / マウス（バーチャルパッド）
+    function setupBtn(id, key) {
+        const btn = document.getElementById(id);
+        const start = (e) => { e.preventDefault(); input[key] = true; btn.classList.add('active'); restartIfFinished(); };
+        const end = (e) => { e.preventDefault(); input[key] = false; btn.classList.remove('active'); };
+        
+        btn.addEventListener('mousedown', start);
+        btn.addEventListener('mouseup', end);
+        btn.addEventListener('mouseleave', end);
+        btn.addEventListener('touchstart', start);
+        btn.addEventListener('touchend', end);
+    }
+
+    setupBtn('btnGas', 'up');
+    setupBtn('btnBrake', 'down');
+    setupBtn('btnLeft', 'left');
+    setupBtn('btnRight', 'right');
+
+    function restartIfFinished() {
+        if (gameState.finished) {
+            resetGame();
+        }
+    }
+
+    // --- ゲームループ ---
+    function update() {
+        if (gameState.startTime === 0 && (input.up || input.down || input.left || input.right)) {
+            gameState.startTime = Date.now();
+        }
+
+        if (!gameState.finished) {
+            // 物理演算
+            if (input.up) car.speed += car.acceleration;
+            if (input.down) car.speed -= car.acceleration;
+
+            // 摩擦と芝生による減速
+            let friction = car.friction;
+            if (!gameState.onRoad) friction = 0.90; // 芝生は重い
+            
+            car.speed *= friction;
+
+            // ハンドリング（スピードが出ているほど曲がりやすいが、止まると曲がれない）
+            if (Math.abs(car.speed) > 0.1) {
+                const direction = car.speed > 0 ? 1 : -1;
+                if (input.left) car.angle -= car.turnSpeed * direction;
+                if (input.right) car.angle += car.turnSpeed * direction;
+            }
+
+            // 座標更新
+            car.x += Math.cos(car.angle) * car.speed;
+            car.y += Math.sin(car.angle) * car.speed;
+
+            // ラップ計測ロジック（簡易版：チェックポイント順通過）
+            checkLap();
+        }
+
+        draw();
+        requestAnimationFrame(update);
+    }
+
+    // --- 描画 ---
+    function draw() {
+        // 背景（芝生）
+        ctx.fillStyle = '#4caf50';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        ctx.save();
+        
+        // カメラ設定（車を画面中央に）
+        ctx.translate(canvas.width / 2 - car.x, canvas.height / 2 - car.y);
+
+        // コース描画
+        drawTrack();
+
+        // 車の描画
+        ctx.save();
+        ctx.translate(car.x, car.y);
+        ctx.rotate(car.angle);
+        
+        // 車体
+        ctx.fillStyle = car.color;
+        ctx.fillRect(-car.width/2, -car.height/2, car.width, car.height);
+        // ヘッドライト
+        ctx.fillStyle = '#ffff00';
+        ctx.fillRect(car.width/2 - 5, -car.height/2, 4, 4); // 右
+        ctx.fillRect(car.width/2 - 5, car.height/2 - 4, 4, 4); // 左
+        // タイヤ
+        ctx.fillStyle = '#000';
+        ctx.fillRect(-8, -20, 8, 4);
+        ctx.fillRect(8, -20, 8, 4);
+        ctx.fillRect(-8, 16, 8, 4);
+        ctx.fillRect(8, 16, 8, 4);
+
+        ctx.restore();
+
+        // 地面判定のためのピクセル取得（現在の車の位置の色を調べる）
+        // オフスクリーン判定だと正確ですが、簡易的に「道路描画パス」内かどうかで判定します。
+        // ここではisPointInPathを使いたいところですが、複雑になるため
+        // 「描画したキャンバスの色」を調べる方法は重くなる可能性があります。
+        // シンプルに「コース描画関数」の中で現在の車の位置との距離を見るのが軽量です。
+        
+        ctx.restore();
+
+        // UI更新
+        updateUI();
+    }
+
+    function drawTrack() {
+        // コースの定義（ベジェ曲線や直線をつなぐ）
+        // 簡易的なオーバルコース + コーナー
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+
+        // 道路のパスを作成
+        const path = new Path2D();
+        path.moveTo(0, 0);
+        path.lineTo(800, 0); // 直線
+        path.arc(800, 400, 400, -Math.PI/2, Math.PI/2); // カーブ
+        path.lineTo(-800, 800); // 下の直線
+        path.arc(-800, 400, 400, Math.PI/2, -Math.PI/2); // 左のカーブ
+        path.lineTo(0, 0); // 戻る
+        path.closePath();
+
+        // 縁石（赤白）
+        ctx.lineWidth = trackWidth + 20;
+        ctx.strokeStyle = '#fff';
+        ctx.stroke(path);
+        ctx.lineWidth = trackWidth + 16;
+        ctx.strokeStyle = '#cc0000'; // 赤
+        ctx.setLineDash([40, 40]);
+        ctx.stroke(path);
+        ctx.setLineDash([]);
+
+        // アスファルト
+        ctx.lineWidth = trackWidth;
+        ctx.strokeStyle = '#666';
+        ctx.stroke(path);
+        
+        // スタートライン
+        ctx.save();
+        ctx.translate(0, 0);
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(-10, -trackWidth/2, 20, trackWidth);
+        // チェッカー模様
+        for(let i=0; i<trackWidth/10; i++) {
+            for(let j=0; j<2; j++) {
+                ctx.fillStyle = (i+j)%2===0 ? '#000' : '#fff';
+                ctx.fillRect(-10 + j*10, -trackWidth/2 + i*10, 10, 10);
+            }
+        }
+        ctx.restore();
+
+        // コース内判定
+        // isPointInStrokeはコンテキストの変換(translate)の影響を受けるため、
+        // カメラ移動後のコンテキストで判定する必要があります。
+        gameState.onRoad = ctx.isPointInStroke(path, car.x, car.y);
+    }
+
+    function checkLap() {
+        // チェックポイント通過ロジック
+        // 1. スタートラインより少し前
+        // 2. コース途中
+        // 3. スタートライン通過
+        
+        // 非常に簡易的な実装: X座標とY座標でエリア判定
+        // 第一コーナー付近
+        if (car.x > 600 && car.y < 200) checkpoints[1].passed = true;
+        // 中間
+        if (car.x < 0 && car.y > 600 && checkpoints[1].passed) checkpoints[3].passed = true;
+        
+        // ゴール判定 (チェックポイント通過後にスタートライン付近に戻ってきたら)
+        if (checkpoints[3].passed && car.x > -100 && car.x < 100 && car.y > -100 && car.y < 100) {
+            // 通過直後連打防止
+            if (car.y < 0 && car.y > -50) { // ラインをまたいだ
+                 // 次の周回へ
+                checkpoints[1].passed = false;
+                checkpoints[3].passed = false;
+                gameState.lap++;
+                
+                if (gameState.lap > gameState.maxLaps) {
+                    finishGame();
+                }
+            }
+        }
+    }
+
+    function updateUI() {
+        if (!gameState.finished) {
+            let time = 0;
+            if (gameState.startTime > 0) {
+                time = (Date.now() - gameState.startTime) / 1000;
+            }
+            document.getElementById('lapTime').innerText = "TIME: " + time.toFixed(2);
+            document.getElementById('currentLap').innerText = Math.min(gameState.lap, gameState.maxLaps);
+        }
+    }
+
+    function finishGame() {
+        gameState.finished = true;
+        document.getElementById('message').style.display = 'block';
+        document.getElementById('message').innerHTML = "GOAL!!<br>" + document.getElementById('lapTime').innerText + "<br><span style='font-size:20px'>Click/Touch to Restart</span>";
+    }
+
+    function resetGame() {
+        gameState.lap = 1;
+        gameState.startTime = 0;
+        gameState.finished = false;
+        checkpoints.forEach(cp => cp.passed = false);
+        
+        car.x = 0;
+        car.y = 0;
+        car.angle = -Math.PI / 2;
+        car.speed = 0;
+        
+        document.getElementById('message').style.display = 'none';
+        
+        // キー入力リセット
+        input.up = false;
+        input.down = false;
+    }
+
+    // ゲーム開始
+    update();
+
+</script>
+</body>
+</html>
